@@ -4,7 +4,7 @@ Asynchronous HTTP/HTTPS header inspection that fingerprints PHP and compares the
 
 ## 1. Overview
 
-**PHP2SHELL CHECK** probes ports **80**, **443**, **8080**, and **8443** and looks for PHP in three places:
+**PHP2SHELL CHECK** probes ports **80**, **443**, **8080**, and **8443** by default (change them with `-p`) and looks for PHP in three places:
 
 - `X-Powered-By` containing `PHP` (for example `PHP/8.2.12` or `ASP.NET, PHP/8.2.12`)
 - `Server` containing a `PHP/x.y.z` token (for example `Apache/2.4.58 (Ubuntu) PHP/8.1.2`)
@@ -23,12 +23,15 @@ Each PHP signal is given a status:
 | --- | --- |
 | `VULNERABLE` | 8.2 < 8.2.35, 8.3 < 8.3.36, 8.4 < 8.4.27, or 8.5 < 8.5.12 |
 | `END OF LIFE` | 8.1 or older. These branches are not covered by the advisories and get no fix. Upgrade the branch. |
+| `VENDOR BUILD` | A distro build (Ubuntu, Debian, RHEL and its rebuilds, Oracle Linux, SUSE) whose upstream number is below the fix, or a 7.4 to 8.1 distro build. The vendor may have backported the fix. Check the package changelog. |
 | `VERSION UNKNOWN` | PHP is present but the version, branch, or patch level is not shown, or the branch is not listed in the advisories |
 | `PATCHED` | At or above the fixed release for its branch |
 
 A host takes the worst status seen on any port. `VERSION UNKNOWN` is used only when no signal on the host shows a version.
 
-Versions with a distro suffix such as `8.3.6-0ubuntu0.24.04.5` are flagged in the note. Debian, Ubuntu, RHEL, and similar vendors backport fixes without changing the upstream version, so confirm those against the package changelog.
+Debian, Ubuntu, RHEL, and similar vendors backport fixes without changing the upstream version, so `8.3.6-0ubuntu0.24.04.5` can be fixed. A version is treated as a vendor build when it has a distro suffix such as `ubuntu`, `deb12u1`, or `el9`, or when the `Server` header of the same response names the OS, as in `Apache/2.4.37 (Red Hat Enterprise Linux)`. Those hosts are `VENDOR BUILD`, not `VULNERABLE` or `END OF LIFE`. Builds from Sury, Alpine, and Fedora track upstream patch releases, so their number is taken as is. Distro builds of 7.3 and older, and Apache's plain `(CentOS)`, stay `END OF LIFE`, because no maintained vendor release ships them. A PHP-FPM host behind nginx usually does not name its OS, so a RHEL build there is still reported by its upstream number.
+
+Hostnames that resolve only to a loopback, `0.0.0.0`, or link-local address (including `169.254.169.254`) are not probed. A stale DNS record would otherwise send the probe to the scanning machine and report its PHP against the client's hostname. They are counted in the summary. An IP address written in the target list is always scanned.
 
 A status is not confirmation that either CVE is exploitable. A host with no PHP signal is not written to the results file, and that is not proof the host is safe.
 
@@ -57,8 +60,9 @@ python php2shellcheck.py -h
 | --- | --- | --- | --- | --- |
 | Target file | `-t` | `--target` | Text file of IP addresses, hostnames, or CIDR blocks, one per line | Yes, unless `-u` is given |
 | URL | `-u` | `--url` | One URL or hostname to scan, such as `https://www.example.com/` or `example.com`. Repeat to add more. | Yes, unless `-t` is given |
+| Ports | `-p` | `--ports` | Comma-separated ports or ranges. Default: `80,443,8080,8443`. Add `/http` or `/https` to force a scheme. At most 256 ports. | No |
 | Output file | `-o` | `--output` | Where to write the results. Default: `scan_results.txt` | No |
-| Quiet mode | `-q` | `--quiet` | Print a host only when it is `VULNERABLE`, `END OF LIFE`, or `VERSION UNKNOWN` | No |
+| Quiet mode | `-q` | `--quiet` | Print a host only when it is `VULNERABLE`, `END OF LIFE`, `VENDOR BUILD`, or `VERSION UNKNOWN` | No |
 
 Blank lines and `#` comments are ignored. CIDR blocks such as `10.0.4.0/24` are expanded to their host addresses. Blocks larger than 65,536 addresses are skipped so a typo like `/8` is not scanned. URLs, ports, and other non-host tokens are skipped and counted in the summary. Duplicate hosts are scanned once. Up to 50 requests run at once. Each request allows 5 seconds to connect and 10 seconds overall. One retry is attempted after a timeout.
 
@@ -78,7 +82,7 @@ While a normal scan runs, a progress bar is drawn on stderr:
 python php2shellcheck.py -t targets.txt
 ```
 
-**Scan one site without a target file.** A full URL or a bare hostname both work. Only the host is kept; the scheme, port, and path are ignored, and all four ports are still probed. `-u` can be repeated and combined with `-t`.
+**Scan one site without a target file.** A full URL or a bare hostname both work. Only the host is kept; the scheme, port, and path are ignored, and every port in `-p` is still probed. `-u` can be repeated and combined with `-t`.
 
 ```bash
 python php2shellcheck.py -u https://www.example.com/
@@ -86,6 +90,13 @@ python php2shellcheck.py -u example.com -u www.example.com
 ```
 
 `example.com` and `www.example.com` are separate hosts. A redirect from one to the other is not followed, so list both when both are in scope.
+
+**Choose the ports.** Ports 80, 81, 591, 8000, 8008, 8080, 8081, and 8888 use HTTP. Ports 443, 4443, 8443, and 9443 use HTTPS. Any other port is tried over HTTPS first, then plain HTTP if the TLS handshake fails. Add `/http` or `/https` to skip the check.
+
+```bash
+python php2shellcheck.py -t targets.txt -p 80,443,8080,8443,9000
+python php2shellcheck.py -t targets.txt -p 80,443,9000/http,8000-8010
+```
 
 **Choose the results path:**
 
@@ -120,6 +131,7 @@ Timestamp: 2026-10-21 16:40:22 EDT
 CVEs: CVE-2026-109618, CVE-2026-109619
 Fixed releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. PHP 8.1 and older is end of life.
 Note: Status comes from version banners. It is an indicator only, not confirmation that the CVE is exploitable.
+Ports probed: 80, 443, 8080, 8443
 
 Host: 192.168.1.10 [VULNERABLE]
   [Port 80/HTTP] X-Powered-By: PHP/8.2.12 -> VULNERABLE (fixed in 8.2.35)
@@ -134,6 +146,7 @@ No HTTP response on any probed port: 12
 Hosts showing PHP: 2
   Vulnerable (unpatched supported branch): 1
   End of life (8.1 or older): 0
+  Vendor build (distro version, fix may be backported): 0
   Version unknown: 0
   Patched: 1
 Hosts with vulnerability indicators: 1 of 6 responding
@@ -146,7 +159,7 @@ If nothing showed PHP, the host list is empty and the summary reports `0 of N re
 The absence of a PHP signal, or a `PATCHED` status, must not be treated as a clean bill of health.
 
 1. **Header suppression.** `expose_php = Off`, or a proxy that strips the headers, hides the signature. The host can still be running PHP.
-2. **Other ports and paths.** Only 80, 443, 8080, and 8443 are probed, and only `/` (plus same-host redirects) and `/index.php` are requested.
+2. **Other ports and paths.** Only the ports given with `-p` (80, 443, 8080, and 8443 by default) are probed, and only `/` (plus same-host redirects) and `/index.php` are requested.
 3. **Virtual hosts.** Scanning an IP address sees only the default site. List hostnames as well when name-based virtual hosts are in scope.
 4. **Banners can be wrong.** Distro backports, version-spoofing proxies, and a load balancer in front of mixed back ends all make the banner differ from the runtime.
 5. **Unpatched runtimes.** Hosts that hide their version, or that listen elsewhere, can still be vulnerable to **CVE-2026-109618** and **CVE-2026-109619**.
@@ -159,7 +172,7 @@ TLS verification is intentionally off for fingerprinting. A network attacker cou
 python -m unittest discover -s tests
 ```
 
-The tests cover version classification, header parsing, target loading, the report summary, and live checks against local test servers. They make no outside network calls.
+The tests cover version classification, vendor builds, port parsing, header parsing, target loading, the report summary, and live checks against local test servers. They make no outside network calls.
 
 ## 7. License
 

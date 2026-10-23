@@ -21,16 +21,20 @@
 
 import argparse
 import asyncio
+import errno
 import ipaddress
 import os
 import re
+import socket
 import ssl
 import sys
 import tempfile
 import time
+import warnings
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
 
 ASCII_ART = r"""
     ___  _  _ ___  ___  ____ _  _ ____ _    _    ____ _  _ ____ ____ _  _
@@ -58,12 +62,18 @@ OLDEST_SUPPORTED = (8, 2)
 
 VULNERABLE = "VULNERABLE"
 END_OF_LIFE = "END OF LIFE"
+VENDOR_BUILD = "VENDOR BUILD"
 UNKNOWN = "VERSION UNKNOWN"
 PATCHED = "PATCHED"
 
 # Worst first. A host takes the worst status seen on any port.
-STATUS_ORDER = (VULNERABLE, END_OF_LIFE, UNKNOWN, PATCHED)
-INDICATOR_STATUSES = (VULNERABLE, END_OF_LIFE, UNKNOWN)
+STATUS_ORDER = (VULNERABLE, END_OF_LIFE, VENDOR_BUILD, UNKNOWN, PATCHED)
+INDICATOR_STATUSES = (VULNERABLE, END_OF_LIFE, VENDOR_BUILD, UNKNOWN)
+
+# Distro vendors backport security fixes without changing the upstream version,
+# so a vendor's 8.3.6 or 7.4.33 can be fixed. Branches older than this are not
+# shipped by any vendor release that is still maintained.
+VENDOR_MIN_BRANCH = (7, 4)
 
 PHP_VERSION = re.compile(
     r"(?i)\bPHP/(\d+)(?:\.(\d+))?(?:\.(\d+))?([-+~][0-9A-Za-z.+~-]*)?"
@@ -71,6 +81,15 @@ PHP_VERSION = re.compile(
 PHP_WORD = re.compile(r"(?i)\bphp\b")
 PHP_SESSION_COOKIE = re.compile(r"(?i)(?:^|[\s;,])PHPSESSID=")
 DISTRO_SUFFIX = re.compile(r"(?i)ubuntu|deb|\.el\d|el\d|sury|suse|amzn|alpine|fc\d")
+# Sury, Alpine, and Fedora ship upstream patch releases, so their version is
+# the real one. The others backport fixes into a frozen upstream version.
+UPSTREAM_SUFFIX = re.compile(r"(?i)sury|alpine|fc\d")
+# Apache names the OS in the Server header, e.g. "Apache/2.4.57 (Rocky Linux)".
+# Plain CentOS is left out: CentOS Linux 7 and 8 are end of life.
+SERVER_VENDOR = re.compile(
+    r"(?i)\((Ubuntu|Debian|Red Hat[^)]*|Rocky Linux|AlmaLinux|CentOS Stream|"
+    r"Oracle[^)]*|SUSE[^)]*|openSUSE[^)]*)\)"
+)
 HOSTNAME = re.compile(
     r"(?=.{1,253}$)"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -78,12 +97,25 @@ HOSTNAME = re.compile(
     re.IGNORECASE,
 )
 
-TARGET_PORTS = (
-    (80, "http"),
-    (443, "https"),
-    (8080, "http"),
-    (8443, "https"),
-)
+DEFAULT_PORT_SPEC = "80,443,8080,8443"
+MAX_PORTS = 256
+# Ports with a well-known scheme. Any other port is tried over HTTPS first and
+# then plain HTTP, unless the -p entry names one, e.g. 9000/http.
+KNOWN_SCHEMES = {
+    80: "http",
+    81: "http",
+    591: "http",
+    8000: "http",
+    8008: "http",
+    8080: "http",
+    8081: "http",
+    8888: "http",
+    443: "https",
+    4443: "https",
+    8443: "https",
+    9443: "https",
+}
+SCHEMES = ("http", "https")
 
 # Many PHP apps send no PHP header from "/" (a static index or a redirect),
 # so a port that answers without one gets a second request here.
@@ -101,7 +133,10 @@ SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 # Old PHP hosts are often the ones that only speak TLS 1.0/1.1 or legacy
 # renegotiation. Allow them so a failed handshake does not hide a hit.
 try:
-    SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1
+    with warnings.catch_warnings():
+        # Python 3.13+ warns that TLSv1 is deprecated; that is the point here.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1
 except (AttributeError, ValueError):
     pass
 try:
@@ -329,6 +364,88 @@ def load_targets(path):
     return hosts, skipped, duplicates
 
 
+def parse_ports(spec):
+    """Return [(port, scheme)] from a list like "80,443,9000/http,8000-8010".
+
+    scheme is None when it should be detected. Raises ValueError with a
+    message for the user.
+    """
+    ports = []
+    seen = set()
+    for raw in spec.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        scheme = None
+        if "/" in item:
+            item, scheme = (part.strip() for part in item.split("/", 1))
+            if scheme not in SCHEMES:
+                raise ValueError(f"'{sanitize(raw, limit=40)}': scheme must be http or https")
+        bounds = item.split("-", 1)
+        if not all(bound.isdigit() for bound in bounds):
+            raise ValueError(f"'{sanitize(raw, limit=40)}' is not a port or port range")
+        low, high = int(bounds[0]), int(bounds[-1])
+        if not 1 <= low <= high <= 65535:
+            raise ValueError(f"'{sanitize(raw, limit=40)}' is outside 1-65535")
+        if high - low + 1 > MAX_PORTS:
+            raise ValueError(f"'{sanitize(raw, limit=40)}' is more than {MAX_PORTS} ports")
+        for port in range(low, high + 1):
+            if port in seen:
+                continue
+            seen.add(port)
+            ports.append((port, scheme or KNOWN_SCHEMES.get(port)))
+            if len(ports) > MAX_PORTS:
+                raise ValueError(f"more than {MAX_PORTS} ports given")
+    if not ports:
+        raise ValueError("no ports given")
+    return ports
+
+
+def describe_ports(ports):
+    """Return "80, 443, and 9000" for the start-up message."""
+    names = [str(port) for port, _scheme in ports]
+    if len(names) <= 2:
+        return " and ".join(names)
+    return ", ".join(names[:-1]) + ", and " + names[-1]
+
+
+def is_local_address(text):
+    """True for loopback, unspecified (0.0.0.0), and link-local addresses."""
+    try:
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback or address.is_unspecified or address.is_link_local
+
+
+class ExternalResolver(AbstractResolver):
+    """Drop local addresses from hostname lookups.
+
+    A stale DNS record pointing at 127.0.0.1 or 0.0.0.0 would otherwise send
+    the probe to the scanning machine, and any PHP running there would be
+    reported against the client's hostname. IP targets do not pass through a
+    resolver, so a 127.0.0.1 written in the target list is still scanned.
+    """
+
+    def __init__(self):
+        self._resolver = aiohttp.DefaultResolver()
+        self.local_hosts = set()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        results = await self._resolver.resolve(host, port, family)
+        kept = [item for item in results if not is_local_address(item["host"])]
+        if not kept:
+            self.local_hosts.add(host.lower().rstrip("."))
+            raise OSError(f"{host} resolves only to local addresses")
+        return kept
+
+    async def close(self):
+        await self._resolver.close()
+
+
 def parse_version(text):
     """Return (major, minor, patch, suffix) from a PHP/x.y.z token, or None."""
     match = PHP_VERSION.search(text)
@@ -343,17 +460,40 @@ def parse_version(text):
     )
 
 
-def classify(version):
-    """Return (status, note) for a parsed version, or for None."""
+def vendor_build(version, vendor=None):
+    """Return the vendor that backports fixes into this build, or None."""
+    _major, _minor, _patch, suffix = version
+    if suffix and UPSTREAM_SUFFIX.search(suffix):
+        return None
+    if suffix and DISTRO_SUFFIX.search(suffix):
+        return "distro"
+    return vendor
+
+
+def classify(version, vendor=None):
+    """Return (status, note) for a parsed version, or for None.
+
+    vendor is the OS named in the Server header of the same response. A vendor
+    build that would be VULNERABLE or END OF LIFE by its upstream number is
+    VENDOR BUILD instead, because the fix may have been backported.
+    """
     if version is None:
         return UNKNOWN, "PHP detected, no version shown"
     major, minor, patch, suffix = version
+    backport = vendor_build(version, vendor)
     note = ""
     if suffix and DISTRO_SUFFIX.search(suffix):
         note = "distro build; vendor may have backported the fix, check the package changelog"
+    vendor_note = (
+        f"{backport} build; vendor may have backported the fix, check the package changelog"
+        if backport
+        else ""
+    )
     if major < OLDEST_SUPPORTED[0] or (
         minor is not None and (major, minor) < OLDEST_SUPPORTED
     ):
+        if backport and minor is not None and (major, minor) >= VENDOR_MIN_BRANCH:
+            return VENDOR_BUILD, f"{vendor_note}; upstream branch {major}.{minor} is end of life"
         return END_OF_LIFE, note or "branch is end of life, no fix released"
     if minor is None:
         return UNKNOWN, "PHP major version only"
@@ -363,6 +503,8 @@ def classify(version):
     if patch is None:
         return UNKNOWN, f"patch level not shown; fixed in {major}.{minor}.{fixed}"
     if patch < fixed:
+        if backport:
+            return VENDOR_BUILD, f"{vendor_note}; upstream fix is {major}.{minor}.{fixed}"
         return VULNERABLE, note or f"fixed in {major}.{minor}.{fixed}"
     return PATCHED, note
 
@@ -375,17 +517,27 @@ def worst_status(statuses):
 
 
 def extract_signals(header_items):
-    """Return (source, value, version) for each header that shows PHP."""
+    """Return (source, value, version, vendor) for each header that shows PHP.
+
+    vendor is the OS named in a Server header of the same response, or None.
+    """
+    vendor = None
+    for key, value in header_items:
+        if str(key).lower() == "server":
+            match = SERVER_VENDOR.search(str(value))
+            if match:
+                vendor = sanitize(match.group(1), limit=40)
+                break
     signals = []
     for key, value in header_items:
         name = str(key).lower()
         cleaned = sanitize(str(value))
         if name == "x-powered-by" and PHP_WORD.search(cleaned):
-            signals.append(("X-Powered-By", cleaned, parse_version(cleaned)))
+            signals.append(("X-Powered-By", cleaned, parse_version(cleaned), vendor))
         elif name == "server" and PHP_VERSION.search(cleaned):
-            signals.append(("Server", cleaned, parse_version(cleaned)))
+            signals.append(("Server", cleaned, parse_version(cleaned), vendor))
         elif name == "set-cookie" and PHP_SESSION_COOKIE.search(" " + cleaned):
-            signals.append(("Set-Cookie", "PHPSESSID", None))
+            signals.append(("Set-Cookie", "PHPSESSID", None, vendor))
     return signals
 
 
@@ -395,8 +547,8 @@ def matching_headers(header_items, port, scheme, path="/"):
     label = f"[Port {port}/{scheme.upper()}]"
     if path != "/":
         label = f"{label} {sanitize(path, limit=100)}"
-    for source, value, version in extract_signals(header_items):
-        status, note = classify(version)
+    for source, value, version, vendor in extract_signals(header_items):
+        status, note = classify(version, vendor)
         rendered = f"{label} {source}: {value} -> {status}"
         if note:
             rendered = f"{rendered} ({note})"
@@ -430,18 +582,17 @@ def parse_arguments():
         "Description:\n"
         "  This script checks for indicators of vulnerability to CVE-2026-109618 "
         "and CVE-2026-109619.\n"
-        "  It probes ports 80, 443, 8080, and 8443 and reads the X-Powered-By "
-        "and Server\n"
-        "  headers and the PHPSESSID cookie, then compares any PHP version shown "
-        "against\n"
-        "  the fixed releases (8.2.35, 8.3.36, 8.4.27, 8.5.12).\n"
+        "  It probes ports 80, 443, 8080, and 8443 (change with -p), reads the\n"
+        "  X-Powered-By and Server headers and the PHPSESSID cookie, then compares\n"
+        "  any PHP version shown against the fixed releases (8.2.35, 8.3.36, 8.4.27,\n"
+        "  8.5.12).\n"
         "  A match is an indicator from a banner. It does not prove the CVE is "
         "exploitable.\n"
         "\n"
         "  Hosts that show PHP are listed with a status. The file ends with a\n"
         "  summary of targets, hosts that responded, and hosts per status.\n"
-        "  Use -q to print vulnerable, end-of-life, and unknown-version hosts and\n"
-        "  nothing else."
+        "  Use -q to print vulnerable, end-of-life, vendor-build, and unknown-version\n"
+        "  hosts and nothing else."
     )
 
     parser = argparse.ArgumentParser(
@@ -467,6 +618,16 @@ def parse_arguments():
         metavar="URL",
         help="One URL or hostname to scan, such as https://www.example.com/ or "
         "example.com. Repeat to add more.",
+    )
+    parser.add_argument(
+        "-p",
+        "--ports",
+        dest="ports",
+        default=DEFAULT_PORT_SPEC,
+        metavar="PORTS",
+        help=f"Comma-separated ports or ranges to probe (default: {DEFAULT_PORT_SPEC}). "
+        "Ports other than the common HTTP and HTTPS ones are tried over HTTPS, then "
+        "HTTP. Add /http or /https to force one, e.g. 80,443,9000/http,8000-8010.",
     )
     parser.add_argument(
         "-o",
@@ -499,6 +660,12 @@ def parse_arguments():
         show_banner()
         error("Error: A target file (-t) or URL (-u) is required.\n")
         parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    try:
+        args.ports = parse_ports(args.ports)
+    except ValueError as exc:
+        error(f"Error: Invalid port list (-p): {exc}.")
         sys.exit(1)
 
     parent = os.path.dirname(os.path.abspath(args.output_file))
@@ -546,20 +713,65 @@ async def fetch_headers(session, url, request_kwargs, retries):
     return None
 
 
+PORT_CLOSED_ERRNOS = {
+    getattr(errno, name)
+    for name in ("ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH")
+    if hasattr(errno, name)
+}
+# Both were added after aiohttp 3.8; an empty tuple matches nothing.
+CONNECT_TIMEOUT = getattr(aiohttp, "ConnectionTimeoutError", ())
+CONNECT_DNS_ERROR = getattr(aiohttp, "ClientConnectorDNSError", ())
+
+
+async def detect_scheme(session, host, port, request_kwargs):
+    """Return "https", "http", or None when the port does not accept a connection.
+
+    Used for ports with no well-known scheme. HTTPS goes first because many
+    TLS servers answer a plain request with a 400 page, which would hide them.
+    """
+    url = f"https://{host_for_url(host)}:{port}/"
+    try:
+        async with session.get(url, ssl=SSL_CONTEXT, **request_kwargs):
+            return "https"
+    except CONNECT_TIMEOUT:
+        return None
+    except aiohttp.ClientConnectorSSLError:
+        return "http"
+    except aiohttp.ClientConnectorError as exc:
+        if getattr(exc.os_error, "errno", None) in PORT_CLOSED_ERRNOS:
+            return None
+        if isinstance(exc, CONNECT_DNS_ERROR):
+            return None
+        return "http"
+    except asyncio.TimeoutError:
+        # Connected but no TLS reply. A plain HTTP server waiting for a
+        # request line behaves this way.
+        return "http"
+    except (aiohttp.ClientError, OSError, ValueError):
+        return "http"
+
+
 async def check_target(session, host, port, scheme, semaphore):
-    """Return (responded, indicators) for one port."""
-    base = f"{scheme}://{host_for_url(host)}:{port}"
+    """Return (responded, indicators) for one port.
+
+    scheme is "http", "https", or None to detect it.
+    """
     request_kwargs = {
         "allow_redirects": False,
         "timeout": aiohttp.ClientTimeout(total=10, connect=5, sock_read=5),
     }
-    if scheme == "https":
-        request_kwargs["ssl"] = SSL_CONTEXT
 
     responded = False
     indicators = []
     seen = set()
     async with semaphore:
+        if scheme is None:
+            scheme = await detect_scheme(session, host, port, request_kwargs)
+            if scheme is None:
+                return False, []
+        if scheme == "https":
+            request_kwargs["ssl"] = SSL_CONTEXT
+        base = f"{scheme}://{host_for_url(host)}:{port}"
         for path in ("/",) + FALLBACK_PATHS:
             url = base + path
             # Retry a timeout only on the first request; a port that has already
@@ -572,9 +784,14 @@ async def check_target(session, host, port, scheme, semaphore):
                 responded = True
                 status, location, headers = result
                 shown = urlsplit(url).path or "/"
-                for item in matching_headers(headers, port, scheme, shown):
-                    if item[1] not in seen:
-                        seen.add(item[1])
+                # The same header on every hop of a redirect chain is one
+                # finding. Keep the first path it was seen on.
+                for item, (_status, key) in zip(
+                    matching_headers(headers, port, scheme, shown),
+                    matching_headers(headers, port, scheme),
+                ):
+                    if key not in seen:
+                        seen.add(key)
                         indicators.append(item)
                 if status not in REDIRECT_CODES or not location:
                     break
@@ -586,11 +803,11 @@ async def check_target(session, host, port, scheme, semaphore):
     return responded, indicators
 
 
-async def process_host(session, host, semaphore):
+async def process_host(session, host, semaphore, ports):
     results = await asyncio.gather(
         *(
             check_target(session, host, port, scheme, semaphore)
-            for port, scheme in TARGET_PORTS
+            for port, scheme in ports
         )
     )
     responded = any(item[0] for item in results)
@@ -600,7 +817,9 @@ async def process_host(session, host, semaphore):
     return responded, indicators
 
 
-def write_report(path, findings, totals, unfinished, skipped, duplicates):
+def write_report(
+    path, findings, totals, unfinished, skipped, duplicates, ports=None, local_hosts=0
+):
     """Write findings, then the summary. Replace the file only when complete.
 
     findings is a list of (host, status, indicators). totals holds the
@@ -616,8 +835,10 @@ def write_report(path, findings, totals, unfinished, skipped, duplicates):
         "CVEs: CVE-2026-109618, CVE-2026-109619",
         f"Fixed releases: {fixed}. PHP 8.1 and older is end of life.",
         "Note: Status comes from version banners. It is an indicator only, not confirmation that the CVE is exploitable.",
-        "",
     ]
+    if ports:
+        lines.append(f"Ports probed: {', '.join(str(port) for port, _scheme in ports)}")
+    lines.append("")
     if not findings:
         lines.append("No hosts showed PHP.")
         lines.append("")
@@ -641,11 +862,14 @@ def write_report(path, findings, totals, unfinished, skipped, duplicates):
             f"Hosts showing PHP: {len(findings)}",
             f"  Vulnerable (unpatched supported branch): {totals[VULNERABLE]}",
             f"  End of life (8.1 or older): {totals[END_OF_LIFE]}",
+            f"  Vendor build (distro version, fix may be backported): {totals[VENDOR_BUILD]}",
             f"  Version unknown: {totals[UNKNOWN]}",
             f"  Patched: {totals[PATCHED]}",
             f"Hosts with vulnerability indicators: {indicated} of {responded} responding",
         ]
     )
+    if local_hosts:
+        lines.append(f"Hostnames not probed because they resolve to a local address: {local_hosts}")
     if unfinished:
         lines.append(f"Scan interrupted: {unfinished} host(s) not finished.")
     if skipped:
@@ -725,7 +949,7 @@ async def main():
 
     if not args.quiet:
         print(
-            f"Starting scan of {len(hosts)} host(s) on ports 80, 443, 8080, and 8443."
+            f"Starting scan of {len(hosts)} host(s) on ports {describe_ports(args.ports)}."
         )
         if skipped:
             print(f"Skipped {skipped} invalid target line(s).")
@@ -739,11 +963,13 @@ async def main():
     workers = []
     findings = []
 
+    resolver = ExternalResolver()
     connector = aiohttp.TCPConnector(
         limit=CONCURRENCY,
         limit_per_host=4,
         force_close=True,
         ttl_dns_cache=60,
+        resolver=resolver,
         ssl=SSL_CONTEXT,
     )
     timeout = aiohttp.ClientTimeout(total=10, connect=5, sock_read=5)
@@ -765,7 +991,7 @@ async def main():
                 try:
                     try:
                         responded, indicators = await process_host(
-                            session, host, semaphore
+                            session, host, semaphore, args.ports
                         )
                     except asyncio.CancelledError:
                         raise
@@ -799,6 +1025,10 @@ async def main():
             await session.close()
         except (asyncio.CancelledError, Exception):
             pass
+        try:
+            await resolver.close()
+        except (asyncio.CancelledError, Exception):
+            pass
         if progress is not None:
             progress.close()
         finished = [item for item in results if item is not None]
@@ -812,6 +1042,8 @@ async def main():
                 unfinished if interrupted else 0,
                 skipped,
                 duplicates,
+                args.ports,
+                len(resolver.local_hosts),
             )
         except OSError as exc:
             write_failed = True
@@ -827,7 +1059,8 @@ async def main():
         print(
             f"Scan complete. {indicated} host(s) with indicators "
             f"({totals[VULNERABLE]} vulnerable, {totals[END_OF_LIFE]} end of life, "
-            f"{totals[UNKNOWN]} version unknown) written to {args.output_file}."
+            f"{totals[VENDOR_BUILD]} vendor build, {totals[UNKNOWN]} version unknown) "
+            f"written to {args.output_file}."
         )
     return 0
 

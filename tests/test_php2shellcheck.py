@@ -36,8 +36,28 @@ class ClassifyTests(unittest.TestCase):
 
     def test_distro_build_is_flagged(self):
         status, note = p.classify(p.parse_version("PHP/8.3.6-0ubuntu0.24.04.5"))
-        self.assertEqual(status, p.VULNERABLE)
+        self.assertEqual(status, p.VENDOR_BUILD)
         self.assertIn("backported", note)
+        status, _note = p.classify(p.parse_version("PHP/8.1.2-1ubuntu2.20"))
+        self.assertEqual(status, p.VENDOR_BUILD)
+
+    def test_distro_build_of_old_branch_is_end_of_life(self):
+        status, note = p.classify(p.parse_version("PHP/7.2.24-0ubuntu0.18.04.17"))
+        self.assertEqual(status, p.END_OF_LIFE)
+        self.assertIn("backported", note)
+
+    def test_upstream_tracking_builds_keep_their_status(self):
+        for text in ("PHP/8.2.20-1+ubuntu22.04.1+deb.sury.org+1", "PHP/8.3.10-r0-alpine"):
+            self.assertEqual(self.status(text), p.VULNERABLE, text)
+        self.assertEqual(self.status("PHP/8.2.35-1+deb12u1"), p.PATCHED)
+
+    def test_server_header_vendor(self):
+        rhel = [("Server", "Apache/2.4.37 (Red Hat Enterprise Linux)"), ("X-Powered-By", "PHP/7.4.33")]
+        self.assertEqual(p.host_status(p.matching_headers(rhel, 443, "https")), p.VENDOR_BUILD)
+        centos = [("Server", "Apache/2.4.6 (CentOS) PHP/7.4.33")]
+        self.assertEqual(p.host_status(p.matching_headers(centos, 80, "http")), p.END_OF_LIFE)
+        plain = [("Server", "nginx"), ("X-Powered-By", "PHP/8.3.6")]
+        self.assertEqual(p.host_status(p.matching_headers(plain, 80, "http")), p.VULNERABLE)
 
 
 class HeaderTests(unittest.TestCase):
@@ -49,7 +69,7 @@ class HeaderTests(unittest.TestCase):
             ("X-Powered-By", "Express"),
             ("Server", "nginx"),
         ]
-        sources = [source for source, _value, _version in p.extract_signals(headers)]
+        sources = [source for source, _value, _version, _vendor in p.extract_signals(headers)]
         self.assertEqual(sources, ["X-Powered-By", "Server", "Set-Cookie"])
 
     def test_header_cannot_forge_report_lines(self):
@@ -69,6 +89,25 @@ class HeaderTests(unittest.TestCase):
 
 
 class TargetTests(unittest.TestCase):
+    def test_parse_ports(self):
+        self.assertEqual(
+            p.parse_ports(p.DEFAULT_PORT_SPEC),
+            [(80, "http"), (443, "https"), (8080, "http"), (8443, "https")],
+        )
+        self.assertEqual(
+            p.parse_ports("443, 9000, 9001/http, 9000/https, 7000-7002/HTTPS"),
+            [(443, "https"), (9000, None), (9001, "http"), (7000, "https"), (7001, "https"), (7002, "https")],
+        )
+        for spec in ("", "0", "65536", "80,abc", "9000/ftp", "1-65535", "90-80", "-80"):
+            with self.assertRaises(ValueError, msg=spec):
+                p.parse_ports(spec)
+
+    def test_local_addresses(self):
+        for text in ("127.0.0.1", "127.8.9.1", "0.0.0.0", "::1", "::", "169.254.169.254", "fe80::1%eth0", "::ffff:127.0.0.1"):
+            self.assertTrue(p.is_local_address(text), text)
+        for text in ("10.0.0.5", "192.168.1.1", "8.8.8.8", "2001:db8::1", "not-an-ip"):
+            self.assertFalse(p.is_local_address(text), text)
+
     def test_cidr_expansion(self):
         self.assertEqual(p.expand_network("192.0.2.0/30"), ["192.0.2.1", "192.0.2.2"])
         self.assertEqual(p.expand_network("192.0.2.7/32"), ["192.0.2.7"])
@@ -158,7 +197,24 @@ class LiveCheckTests(unittest.IsolatedAsyncioTestCase):
             raise web.HTTPFound("http://other.invalid/")
 
         self.runners = []
+        async def admin_console(request):
+            return web.Response(text="ok", headers={"X-Powered-By": "PHP/8.5.9"})
+
         self.redirect_port = await self.serve([("/", root), ("/app/", app)])
+        self.console_port = await self.serve([("/", admin_console)])
+
+        async def chain_root(request):
+            raise web.HTTPFound("/portal/", headers={"X-Powered-By": "PHP/8.4.5"})
+
+        async def chain_mid(request):
+            raise web.HTTPFound("user/", headers={"X-Powered-By": "PHP/8.4.5"})
+
+        async def chain_end(request):
+            return web.Response(text="ok", headers={"X-Powered-By": "PHP/8.4.5"})
+
+        self.chain_port = await self.serve(
+            [("/", chain_root), ("/portal/", chain_mid), ("/portal/user/", chain_end)]
+        )
         self.fallback_port = await self.serve([("/", static_root), ("/index.php", index_php)])
         self.offsite_port = await self.serve([("/", offsite)])
         self.session = aiohttp.ClientSession()
@@ -189,6 +245,12 @@ class LiveCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.host_status(indicators), p.VULNERABLE)
         self.assertIn("/app/", indicators[0][1])
 
+    async def test_redirect_chain_reports_header_once(self):
+        responded, indicators = await self.check(self.chain_port)
+        self.assertTrue(responded)
+        self.assertEqual(len(indicators), 1)
+        self.assertNotIn("/portal/", indicators[0][1])
+
     async def test_fallback_path(self):
         responded, indicators = await self.check(self.fallback_port)
         self.assertTrue(responded)
@@ -199,6 +261,35 @@ class LiveCheckTests(unittest.IsolatedAsyncioTestCase):
         responded, indicators = await self.check(self.offsite_port)
         self.assertTrue(responded)
         self.assertEqual(indicators, [])
+
+    async def test_unknown_port_falls_back_to_http(self):
+        responded, indicators = await p.check_target(
+            self.session, "127.0.0.1", self.console_port, None, self.semaphore
+        )
+        self.assertTrue(responded)
+        self.assertEqual(p.host_status(indicators), p.VULNERABLE)
+        self.assertIn(f"[Port {self.console_port}/HTTP]", indicators[0][1])
+
+    async def test_unknown_closed_port_is_not_responding(self):
+        responded, indicators = await p.check_target(
+            self.session, "127.0.0.1", 1, None, self.semaphore
+        )
+        self.assertFalse(responded)
+        self.assertEqual(indicators, [])
+
+    async def test_hostname_resolving_to_loopback_is_not_probed(self):
+        resolver = p.ExternalResolver()
+        session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=resolver))
+        try:
+            responded, indicators = await p.check_target(
+                session, "localhost", self.console_port, "http", self.semaphore
+            )
+        finally:
+            await session.close()
+            await resolver.close()
+        self.assertFalse(responded)
+        self.assertEqual(indicators, [])
+        self.assertEqual(resolver.local_hosts, {"localhost"})
 
     async def test_closed_port_is_not_responding(self):
         responded, indicators = await self.check(1)
